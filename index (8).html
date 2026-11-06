@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Offline Study Planner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+</head>
+<body class="bg-gray-100 text-gray-900 font-sans antialiased p-4">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // Icons
+        const TrashIcon = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>;
+        const EditIcon = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>;
+        const ChevronDownIcon = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>;
+        const ChevronUpIcon = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 15l7-7 7 7" /></svg>;
+        const UploadIcon = () => <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>;
+
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('schedule');
+            
+            // State: Courses & Plans
+            const [courses, setCourses] = useState(() => JSON.parse(localStorage.getItem('study_courses')) || []);
+            const [dailyTodos, setDailyTodos] = useState(() => JSON.parse(localStorage.getItem('study_todos')) || []);
+            
+            // State: Form
+            const [courseName, setCourseName] = useState('');
+            const [instructor, setInstructor] = useState('');
+            const [midtermDate, setMidtermDate] = useState('');
+            const [finalDate, setFinalDate] = useState('');
+            const [lectures, setLectures] = useState(Array.from({length: 13}, (_, i) => ({ week: i + 1, topic: '' })));
+            const [isParsing, setIsParsing] = useState(false);
+            const [editingCourseId, setEditingCourseId] = useState(null);
+
+            // State: UI
+            const [expandedDates, setExpandedDates] = useState({});
+
+            useEffect(() => {
+                localStorage.setItem('study_courses', JSON.stringify(courses));
+                localStorage.setItem('study_todos', JSON.stringify(dailyTodos));
+            }, [courses, dailyTodos]);
+
+// PDF Parsing Logic (Local) - 좌표(X,Y) 기반 표 구조 완벽 추출
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                setIsParsing(true);
+                setCourseName(file.name.replace('.pdf', '').replace('.docx', '')); 
+                
+                try {
+                    const fileReader = new FileReader();
+                    fileReader.onload = async function() {
+                        const typedarray = new Uint8Array(this.result);
+                        const pdf = await pdfjsLib.getDocument(typedarray).promise;
+                        
+                        let fullText = "";
+                        let allItems = [];
+
+                        for (let i = 1; i <= pdf.numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const viewport = page.getViewport({ scale: 1.0 });
+                            const textContent = await page.getTextContent();
+                            
+                            // 전체 텍스트 (기본 정보 추출용)
+                            fullText += textContent.items.map(s => s.str).join(" ") + " ";
+
+                            // 표 추출을 위해 페이지별 Y좌표를 연속된 절대 좌표로 변환하여 저장
+                            textContent.items.forEach(item => {
+                                const text = item.str.trim();
+                                if (text) {
+                                    allItems.push({
+                                        str: text,
+                                        x: item.transform[4], // 가로 위치
+                                        // 페이지가 넘어갈수록 Y값이 계속 커지도록 설정 (위에서 아래로 정렬)
+                                        absY: (i - 1) * viewport.height + (viewport.height - item.transform[5])
+                                    });
+                                }
+                            });
+                        }
+
+                        // 1. 코스 이름 추출 (Effective Start Date 앞까지만 정확히 자르기)
+                        const courseMatch = fullText.match(/Course Code & Title\s+(.+?)(?=Effective Start Date|Offering Unit)/i);
+                        if (courseMatch) {
+                            setCourseName(courseMatch[1].trim());
+                        }
+
+                        // 2. 교수님 이름 추출 (중복된 성 제거 포함)
+                        const instructorMatch = fullText.match(/Instructor\(s\)\s+(.+?)(?=\(|Instruction Mode)/i);
+                        if (instructorMatch) {
+                            let rawInst = instructorMatch[1].replace(/,/g, '').trim();
+                            // 예: "JOHN SEQUEIRA SEQUEIRA" -> 중복 단어 제거
+                            const words = rawInst.split(/\s+/);
+                            const uniqueWords = words.filter((w, idx) => words.indexOf(w) === idx);
+                            setInstructor(uniqueWords.join(' '));
+                        }
+
+                        // 3. 개강일(Effective Start Date) 추출
+                        let courseStartDate = null;
+                        const startDateMatch = fullText.match(/Effective Start Date\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/i);
+                        if (startDateMatch) {
+                            const day = startDateMatch[1].padStart(2, '0');
+                            const month = startDateMatch[2].padStart(2, '0');
+                            const year = startDateMatch[3];
+                            courseStartDate = new Date(`${year}-${month}-${day}`); 
+                        }
+
+                        // 4. Weekly Lesson Plan 시작과 끝 Y좌표 찾기
+                        const startPlanItem = allItems.find(item => /Weekly Lesson Plan/i.test(item.str));
+                        const endPlanItem = allItems.find(item => /Recommended Textbooks|Other Information|UNIVERSITY POLICIES/i.test(item.str) && (!startPlanItem || item.absY > startPlanItem.absY));
+
+                        let newLectures = Array.from({length: 13}, (_, i) => ({ week: i + 1, topic: '' }));
+                        let detectedMidtermWeek = null;
+                        let detectedFinalWeek = null;
+
+                        if (startPlanItem) {
+                            const startY = startPlanItem.absY;
+                            const endY = endPlanItem ? endPlanItem.absY : Infinity;
+
+                            // Weekly Lesson Plan 표 안에 있는 텍스트만 필터링
+                            const planItems = allItems.filter(item => item.absY > startY && item.absY < endY);
+
+                            // 왼쪽 열(x < 100)에서 주차 숫자(1 ~ 16)만 찾기
+                            const weekMarkers = planItems
+                                .filter(item => item.x < 100 && /^(?:Week\s*)?([1-9]|1[0-6])$/i.test(item.str))
+                                .map(item => ({
+                                    week: parseInt(item.str.match(/\d+/)[0]),
+                                    absY: item.absY
+                                }))
+                                .sort((a, b) => a.absY - b.absY);
+
+                            // 중복 주차 마커 제거
+                            const uniqueMarkers = [];
+                            weekMarkers.forEach(m => {
+                                if (!uniqueMarkers.some(u => u.week === m.week)) {
+                                    uniqueMarkers.push(m);
+                                }
+                            });
+
+                            // 각 주차 숫자(1, 2, 3...)가 가운데 정렬되어 있으므로, 
+                            // 인접한 두 주차 숫자의 중간 지점(Midpoint)을 행(Row)의 경계선으로 계산
+                            for (let i = 0; i < uniqueMarkers.length; i++) {
+                                const curr = uniqueMarkers[i];
+                                const prev = i > 0 ? uniqueMarkers[i - 1] : null;
+                                const next = i < uniqueMarkers.length - 1 ? uniqueMarkers[i + 1] : null;
+
+                                const topBound = prev ? (prev.absY + curr.absY) / 2 : startY + 15;
+                                const bottomBound = next ? (curr.absY + next.absY) / 2 : endY - 10;
+
+                                // 해당 행(topBound ~ bottomBound) 안에서 가운데 열(Topic: 100 <= x < 420) 텍스트만 추출
+                                const rowItems = planItems
+                                    .filter(item => item.absY >= topBound && item.absY < bottomBound && item.x >= 100 && item.x < 420)
+                                    .filter(item => !/^(Week|Topic|Remarks)$/i.test(item.str))
+                                    .sort((a, b) => a.absY - b.absY || a.x - b.x);
+
+                                // 불릿 포인트(•) 전까지의 핵심 강의 제목만 깔끔하게 추출 (원하면 전체 추출도 가능)
+                                const fullRowText = rowItems.map(item => item.str).join(" ").replace(/\s+/g, " ").trim();
+                                const mainTitle = fullRowText.split('•')[0].trim() || fullRowText;
+
+                                // Midterm / Final 주차 감지 (14, 15주차도 감지하도록 처리)
+                                const lowerText = fullRowText.toLowerCase();
+                                if (lowerText.includes('midterm') || lowerText.includes('mid-term')) {
+                                    detectedMidtermWeek = curr.week;
+                                }
+                                if (lowerText.includes('final exam')) {
+                                    detectedFinalWeek = curr.week;
+                                }
+
+                                // 1~13주차 강의 목록에 저장
+                                if (curr.week >= 1 && curr.week <= 13) {
+                                    newLectures[curr.week - 1].topic = mainTitle.substring(0, 80);
+                                }
+                            }
+                        }
+
+                        // 만약 표에서 기말고사를 못 찾았다면 상단 Assessment 표에서 "Final Examination ... Week 16" 감지
+                        if (!detectedFinalWeek) {
+                            const finalMatch = fullText.match(/Final Examination[\s\S]{1,100}?Week\s*(\d+)/i);
+                            if (finalMatch) detectedFinalWeek = parseInt(finalMatch[1]);
+                        }
+
+                        // 5. 개강일 기준으로 Midterm / Final 날짜 자동 계산
+                        if (courseStartDate) {
+                            if (detectedMidtermWeek) {
+                                const mDate = new Date(courseStartDate);
+                                mDate.setDate(mDate.getDate() + (detectedMidtermWeek - 1) * 7);
+                                setMidtermDate(mDate.toISOString().split('T')[0]);
+                            }
+                            if (detectedFinalWeek) {
+                                const fDate = new Date(courseStartDate);
+                                fDate.setDate(fDate.getDate() + (detectedFinalWeek - 1) * 7);
+                                setFinalDate(fDate.toISOString().split('T')[0]);
+                            }
+                        }
+
+                        setLectures(newLectures);
+                        setIsParsing(false);
+                    };
+                    fileReader.readAsArrayBuffer(file);
+                } catch (error) {
+                    console.error("PDF Parsing Error:", error);
+                    setIsParsing(false);
+                    alert("Failed to parse PDF. Please enter manually.");
+                }
+            };
+            const generateTodos = (courseId, cName, mid, fin, lecs) => {
+                let generated = [];
+                let today = new Date();
+                
+                lecs.forEach((lec, idx) => {
+                    let taskDate = new Date(today);
+                    taskDate.setDate(taskDate.getDate() + (idx * 2)); 
+                    generated.push({
+                        id: Date.now() + Math.random(),
+                        courseId,
+                        courseName: cName,
+                        text: `Week ${lec.week}: ${lec.topic || 'Review'}`,
+                        date: taskDate.toISOString().split('T')[0],
+                        completed: false
+                    });
+                });
+
+                if (mid) {
+                    let midDate = new Date(mid);
+                    midDate.setDate(midDate.getDate() - 2);
+                    generated.push({
+                        id: Date.now() + Math.random(),
+                        courseId,
+                        courseName: cName,
+                        text: `Midterm Exam Preparation`,
+                        date: midDate.toISOString().split('T')[0],
+                        completed: false
+                    });
+                }
+
+                if (fin) {
+                    let finDate = new Date(fin);
+                    finDate.setDate(finDate.getDate() - 2);
+                    generated.push({
+                        id: Date.now() + Math.random(),
+                        courseId,
+                        courseName: cName,
+                        text: `Final Exam Preparation`,
+                        date: finDate.toISOString().split('T')[0],
+                        completed: false
+                    });
+                }
+                
+                return generated;
+            };
+
+            const handleSaveCourse = () => {
+                if (!courseName) return alert("Enter course name!");
+                
+                const newCourse = {
+                    id: editingCourseId || Date.now(),
+                    name: courseName,
+                    instructor: instructor,
+                    midterm: midtermDate,
+                    final: finalDate,
+                    lectures: lectures
+                };
+
+                let updatedCourses = [...courses];
+                let updatedTodos = [...dailyTodos];
+
+                if (editingCourseId) {
+                    updatedCourses = updatedCourses.map(c => c.id === editingCourseId ? newCourse : c);
+                    updatedTodos = updatedTodos.map(t => t.courseId === editingCourseId ? { ...t, courseName: newCourse.name } : t);
+                } else {
+                    updatedCourses.push(newCourse);
+                    const newTodos = generateTodos(newCourse.id, newCourse.name, midtermDate, finalDate, lectures);
+                    updatedTodos = [...updatedTodos, ...newTodos];
+                }
+
+                setCourses(updatedCourses);
+                setDailyTodos(updatedTodos);
+                resetForm();
+                setActiveTab('schedule');
+            };
+
+            const resetForm = () => {
+                setCourseName('');
+                setInstructor('');
+                setMidtermDate('');
+                setFinalDate('');
+                setLectures(Array.from({length: 13}, (_, i) => ({ week: i + 1, topic: '' })));
+                setEditingCourseId(null);
+            };
+
+            const editCourse = (course) => {
+                setCourseName(course.name);
+                setInstructor(course.instructor || '');
+                setMidtermDate(course.midterm || '');
+                setFinalDate(course.final || '');
+                setLectures(course.lectures || Array.from({length: 13}, (_, i) => ({ week: i + 1, topic: '' })));
+                setEditingCourseId(course.id);
+                window.scrollTo(0, 0);
+            };
+
+            const forceQuitCourse = (courseId) => {
+                if (confirm("Are you sure you want to force quit? This will delete the course and ALL its generated study plans.")) {
+                    setCourses(courses.filter(c => c.id !== courseId));
+                    setDailyTodos(dailyTodos.filter(t => t.courseId !== courseId));
+                    if (editingCourseId === courseId) resetForm();
+                }
+            };
+
+            // Toggle logic for Schedule
+            const toggleTodo = (id) => {
+                setDailyTodos(dailyTodos.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
+            };
+
+            const toggleDateCollapse = (dateStr) => {
+                setExpandedDates(prev => ({ ...prev, [dateStr]: !prev[dateStr] }));
+            };
+
+            const expandAll = () => {
+                const allExpanded = {};
+                Object.keys(groupedTodos).forEach(date => allExpanded[date] = true);
+                setExpandedDates(allExpanded);
+            };
+
+            const collapseAll = () => {
+                setExpandedDates({});
+            };
+
+            const updateTodoDate = (id, newDate) => {
+                if (!newDate) return;
+                setDailyTodos(dailyTodos.map(t => t.id === id ? { ...t, date: newDate } : t));
+            };
+
+            // Group todos by date
+            const groupedTodos = dailyTodos.reduce((acc, todo) => {
+                if (!acc[todo.date]) acc[todo.date] = [];
+                acc[todo.date].push(todo);
+                return acc;
+            }, {});
+
+            const sortedDates = Object.keys(groupedTodos).sort();
+
+            return (
+                <div className="max-w-4xl mx-auto bg-white shadow-xl rounded-2xl overflow-hidden min-h-[800px] border border-gray-200 flex flex-col">
+                    {/* Header Tabs */}
+                    <div className="flex bg-gray-800 text-white">
+                        <button 
+                            className={`flex-1 py-4 font-bold text-lg transition-colors ${activeTab === 'schedule' ? 'bg-blue-600' : 'hover:bg-gray-700'}`}
+                            onClick={() => setActiveTab('schedule')}
+                        >
+                            Daily Schedule
+                        </button>
+                        <button 
+                            className={`flex-1 py-4 font-bold text-lg transition-colors ${activeTab === 'plan' ? 'bg-blue-600' : 'hover:bg-gray-700'}`}
+                            onClick={() => setActiveTab('plan')}
+                        >
+                            Auto Plan / Courses
+                        </button>
+                    </div>
+
+                    {/* Content Area */}
+                    <div className="p-6 flex-grow overflow-y-auto">
+                        
+                        {/* Auto Plan & Registered Courses Tab */}
+                        {activeTab === 'plan' && (
+                            <div className="space-y-8">
+                                {/* Form Section */}
+                                <div className="bg-gray-50 p-6 rounded-xl border border-gray-200 shadow-sm">
+                                    <h2 className="text-2xl font-bold mb-4 text-gray-800">
+                                        {editingCourseId ? 'Edit Registered Course' : 'Register New Course'}
+                                    </h2>
+                                    
+                                    {!editingCourseId && (
+                                        <div className="mb-6">
+                                            <label className="flex items-center gap-2 cursor-pointer bg-white border-2 border-dashed border-gray-300 p-6 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-colors">
+                                                <input type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
+                                                <UploadIcon />
+                                                <span className="text-gray-600 font-medium">{isParsing ? 'Parsing PDF offline...' : 'Upload Course PDF to Auto-Fill'}</span>
+                                            </label>
+                                        </div>
+                                    )}
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                                        <div>
+                                            <label className="block text-sm font-bold text-gray-700 mb-1">Course Name</label>
+                                            <input type="text" className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={courseName} onChange={e => setCourseName(e.target.value)} placeholder="e.g. Accounting 101" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-bold text-gray-700 mb-1">Instructor</label>
+                                            <input type="text" className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={instructor} onChange={e => setInstructor(e.target.value)} placeholder="e.g. YOUNG JUN CHO" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-bold text-gray-700 mb-1">Midterm Date</label>
+                                            <input type="date" className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={midtermDate} onChange={e => setMidtermDate(e.target.value)} />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-bold text-gray-700 mb-1">Final Date</label>
+                                            <input type="date" className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" value={finalDate} onChange={e => setFinalDate(e.target.value)} />
+                                        </div>
+                                    </div>
+
+                                    <div className="mb-6">
+                                        <h3 className="font-bold text-gray-800 mb-2">Lecture Schedule</h3>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-60 overflow-y-auto p-2 bg-white border rounded-lg">
+                                            {lectures.map((lec, index) => (
+                                                <div key={index} className="flex items-center gap-2">
+                                                    <span className="w-20 text-sm font-semibold text-gray-500">Week {lec.week}</span>
+                                                    <input type="text" className="flex-grow p-2 border rounded text-sm focus:ring-2 focus:ring-blue-500 outline-none" value={lec.topic} onChange={(e) => {
+                                                        const newLecs = [...lectures];
+                                                        newLecs[index].topic = e.target.value;
+                                                        setLectures(newLecs);
+                                                    }} placeholder="Lecture topic..." />
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    <div className="flex gap-3">
+                                        {editingCourseId && (
+                                            <button onClick={resetForm} className="px-6 py-3 bg-gray-200 text-gray-800 font-bold rounded-lg hover:bg-gray-300 transition-colors">
+                                                Cancel Edit
+                                            </button>
+                                        )}
+                                        <button onClick={handleSaveCourse} className="flex-grow bg-blue-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-blue-700 transition-colors shadow-md">
+                                            {editingCourseId ? 'Save Changes' : 'Generate Study Plan'}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Registered Courses Section */}
+                                <div>
+                                    <h2 className="text-2xl font-bold mb-4 text-gray-800 border-b pb-2">Registered Courses</h2>
+                                    {courses.length === 0 ? (
+                                        <p className="text-gray-500 italic">No courses registered yet.</p>
+                                    ) : (
+                                        <div className="space-y-3">
+                                            {courses.map(course => (
+                                                <div key={course.id} className="flex items-center justify-between p-4 bg-white border border-gray-200 rounded-xl shadow-sm hover:shadow-md transition-shadow">
+                                                    <div 
+                                                        className="flex-grow cursor-pointer group"
+                                                        onClick={() => editCourse(course)}
+                                                    >
+                                                        <h3 className="font-bold text-lg text-gray-800 group-hover:text-blue-600 transition-colors">{course.name}</h3>
+                                                        <p className="text-sm text-gray-500">
+                                                            {course.instructor && `Prof. ${course.instructor} `}
+                                                            {course.midterm && `| Mid: ${course.midterm} `} 
+                                                            {course.final && `| Fin: ${course.final}`}
+                                                        </p>
+                                                    </div>
+                                                    <div className="flex gap-2">
+                                                        <button onClick={() => editCourse(course)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg" title="Edit Course">
+                                                            <EditIcon />
+                                                        </button>
+                                                        <button onClick={() => forceQuitCourse(course.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg" title="Force Quit">
+                                                            <TrashIcon />
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Schedule Tab */}
+                        {activeTab === 'schedule' && (
+                            <div>
+                                <div className="flex justify-between items-center mb-6">
+                                    <h2 className="text-2xl font-bold text-gray-800">Daily Study Plan</h2>
+                                    <div className="space-x-3">
+                                        <button onClick={expandAll} className="px-4 py-2 text-sm font-semibold bg-gray-100 text-gray-700 rounded-lg border hover:bg-gray-200 transition-colors">Expand All</button>
+                                        <button onClick={collapseAll} className="px-4 py-2 text-sm font-semibold bg-gray-100 text-gray-700 rounded-lg border hover:bg-gray-200 transition-colors">Collapse All</button>
+                                    </div>
+                                </div>
+
+                                {sortedDates.length === 0 ? (
+                                    <div className="text-center py-20 text-gray-500">
+                                        <p className="text-lg">No study plans yet.</p>
+                                        <button onClick={() => setActiveTab('plan')} className="mt-4 text-blue-600 font-semibold hover:underline">Register a course to start</button>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {sortedDates.map(dateStr => {
+                                            const dayTodos = groupedTodos[dateStr];
+                                            const isExpanded = expandedDates[dateStr];
+                                            const allDone = dayTodos.every(t => t.completed);
+                                            
+                                            return (
+                                                <div key={dateStr} className={`border rounded-xl overflow-hidden transition-all ${allDone ? 'bg-gray-50 border-gray-200' : 'bg-white border-blue-100 shadow-sm'}`}>
+                                                    <div 
+                                                        className="flex justify-between items-center p-4 cursor-pointer hover:bg-gray-50"
+                                                        onClick={() => toggleDateCollapse(dateStr)}
+                                                    >
+                                                        <h3 className={`font-bold text-lg ${allDone ? 'text-gray-400 line-through' : 'text-blue-800'}`}>
+                                                            {new Date(dateStr).toDateString()}
+                                                            <span className="ml-3 text-sm font-normal text-gray-500 no-underline">
+                                                                ({dayTodos.filter(t => t.completed).length}/{dayTodos.length} done)
+                                                            </span>
+                                                        </h3>
+                                                        <button className="text-gray-400">
+                                                            {isExpanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
+                                                        </button>
+                                                    </div>
+                                                    
+                                                    {isExpanded && (
+                                                        <div className="p-4 pt-0 border-t bg-white">
+                                                            <ul className="space-y-2 mt-3">
+                                                                {dayTodos.map(todo => (
+                                                                    <li key={todo.id} className="flex items-center justify-between p-3 rounded-lg border border-gray-100 hover:bg-gray-50 group transition-colors">
+                                                                        <div className="flex items-center gap-3 overflow-hidden flex-grow cursor-pointer" onClick={() => toggleTodo(todo.id)}>
+                                                                            <input type="checkbox" checked={todo.completed} readOnly className="w-5 h-5 rounded text-blue-600 cursor-pointer" />
+                                                                            <div className="flex-grow truncate">
+                                                                                <span className="text-xs font-bold text-blue-600 bg-blue-100 px-2 py-1 rounded-md mr-2">{todo.courseName}</span>
+                                                                                <span className={`text-gray-700 font-medium ${todo.completed ? 'line-through text-gray-400' : ''}`}>{todo.text}</span>
+                                                                            </div>
+                                                                        </div>
+                                                                        <input 
+                                                                            type="date" 
+                                                                            value={todo.date}
+                                                                            onChange={(e) => updateTodoDate(todo.id, e.target.value)}
+                                                                            className="ml-4 p-1 text-sm border rounded text-gray-500 outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                                                                            title="Reschedule"
+                                                                        />
+                                                                    </li>
+                                                                ))}
+                                                            </ul>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
